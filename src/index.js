@@ -27,7 +27,20 @@ const server = http.createServer(async (req, res) => {
 
   // 测试端点 - 用 curl
   if (url.pathname === '/test-curl') {
-    exec('curl -s https://www.futbin.org/futbin/api/26/getSTCCheapest?definitionId=239653', (error, stdout, stderr) => {
+    const cmd = `curl -s 'https://www.futbin.org/futbin/api/26/getSTCCheapest?definitionId=239653' \\
+  -H 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7' \\
+  -H 'accept-language: zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5,ja;q=0.4' \\
+  -H 'priority: u=0, i' \\
+  -H 'sec-ch-ua: "Microsoft Edge";v="147", "Not.A/Brand";v="8", "Chromium";v="147"' \\
+  -H 'sec-ch-ua-mobile: ?0' \\
+  -H 'sec-ch-ua-platform: "Windows"' \\
+  -H 'sec-fetch-dest: document' \\
+  -H 'sec-fetch-mode: navigate' \\
+  -H 'sec-fetch-site: none' \\
+  -H 'sec-fetch-user: ?1' \\
+  -H 'upgrade-insecure-requests: 1' \\
+  -H 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0'`;
+    exec(cmd, (error, stdout, stderr) => {
       if (error) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: error.message }));
@@ -35,7 +48,7 @@ const server = http.createServer(async (req, res) => {
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
-        curlResult: stdout.substring(0, 500),
+        curlResult: stdout.substring(0, 1000),
       }));
     });
     return;
