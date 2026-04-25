@@ -1,5 +1,5 @@
 {
-  "name": "eafc-price-server",
+  "name": "eafc-grinder-server",
   "version": "1.0.0",
   "description": "EAFC Card Price Server - Futbin price lookup API",
   "main": "src/index.js",

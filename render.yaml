@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: eafc-price-server
-    env: node
-    buildCommand: npm install
-    startCommand: node src/index.js
-    envVars:
-      - key: NODE_ENV
-        value: production

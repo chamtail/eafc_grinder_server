@@ -165,3 +165,4 @@ node_modules/
 wrangler.log
 .wrangler/
 .dev.vars*
+AGENTS.md
