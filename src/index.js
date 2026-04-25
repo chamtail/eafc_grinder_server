@@ -5,6 +5,7 @@
 
 const { fetch } = require('undici');
 const http = require('http');
+const { exec } = require('child_process');
 
 // 内存缓存：definitionId -> { price, timestamp }
 const CACHE_TTL = 30 * 60 * 1000; // 30 分钟
@@ -24,7 +25,23 @@ const PORT = process.env.PORT || 8787;
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
-  // 测试端点
+  // 测试端点 - 用 curl
+  if (url.pathname === '/test-curl') {
+    exec('curl -s https://www.futbin.org/futbin/api/26/getSTCCheapest?definitionId=239653', (error, stdout, stderr) => {
+      if (error) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: error.message }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        curlResult: stdout.substring(0, 500),
+      }));
+    });
+    return;
+  }
+
+  // 测试端点 - 用 fetch
   if (url.pathname === '/test') {
     const futbinUrl = 'https://www.futbin.org/futbin/api/26/getSTCCheapest?definitionId=239653';
     try {
