@@ -1,0 +1,7 @@
+name = "eafc-price-server"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[dev]
+port = 3000
+local_protocol = "http"

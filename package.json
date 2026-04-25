@@ -1,0 +1,16 @@
+{
+  "name": "eafc-price-server",
+  "version": "1.0.0",
+  "description": "EAFC Card Price Server - Futbin price lookup API",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js"
+  },
+  "dependencies": {
+    "undici": "^6.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
