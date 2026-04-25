@@ -43,6 +43,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 简单测试端点
+  if (url.pathname === '/hello') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Hello World');
+    return;
+  }
+
   // CORS 预检
   if (req.method === 'OPTIONS') {
     res.writeHead(200, {
