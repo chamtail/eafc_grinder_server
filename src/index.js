@@ -20,6 +20,29 @@ const PORT = process.env.PORT || 8787;
 const CACHE_TTL = 30 * 60 * 1000;       // 30 分钟（成功缓存）
 const FAIL_CACHE_TTL = 5 * 60 * 1000;   // 5 分钟（失败缓存）
 const MAPPING_FILE = path.join(__dirname, '..', 'mapping.json');
+const FUTBIN_CONCURRENCY = 20;          // 同时向 futbin 发出的最大请求数
+
+// ========== Futbin 全局并发控制 ==========
+const futbinQueue = [];
+let futbinActive = 0;
+
+function futbinEnqueue(fn) {
+  return new Promise((resolve, reject) => {
+    futbinQueue.push({ fn, resolve, reject });
+    futbinDrain();
+  });
+}
+
+function futbinDrain() {
+  while (futbinActive < FUTBIN_CONCURRENCY && futbinQueue.length > 0) {
+    const { fn, resolve, reject } = futbinQueue.shift();
+    futbinActive++;
+    fn().then(resolve, reject).finally(() => {
+      futbinActive--;
+      futbinDrain();
+    });
+  }
+}
 
 // ========== 数据存储 ==========
 // 映射表: definitionId -> futbinId (平台通用)
@@ -190,13 +213,16 @@ function validateRequest(body) {
 // ========== 价格查询 ==========
 async function batchGetPrices(definitionIds, platform, players) {
   const start = Date.now();
+  // 并行请求所有 ID
+  const results = await Promise.all(
+    definitionIds.map(id => getPrice(id, platform, players[id] || null))
+  );
   const result = {};
   let hitCount = 0;
-  for (const id of definitionIds) {
-    const price = await getPrice(id, platform, players[id] || null);
-    result[id] = price;
-    if (price.price != null) hitCount++;
-  }
+  definitionIds.forEach((id, i) => {
+    result[id] = results[i];
+    if (results[i].price != null) hitCount++;
+  });
   console.log(`[Batch] ${definitionIds.length} ids, ${hitCount} prices, ${Date.now() - start}ms`);
   return result;
 }
@@ -346,9 +372,9 @@ function parsePriceFromMinimal(data, definitionId, platform) {
   return null;
 }
 
-// ========== 通用请求 ==========
-async function fetchWithHeaders(url) {
-  return fetch(url, {
+// ========== 通用请求（受全局并发控制） ==========
+function fetchWithHeaders(url) {
+  return futbinEnqueue(() => fetch(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -362,7 +388,7 @@ async function fetchWithHeaders(url) {
       'sec-fetch-user': '?1',
       'upgrade-insecure-requests': '1',
     },
-  });
+  }));
 }
 
 // ========== 映射持久化 ==========
