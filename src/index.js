@@ -2,27 +2,67 @@
  * EAFC Grinder Server
  * Node.js Server - 卡价查询后端
  *
- * 客户端传 definitionIds + platform 查价格
- * - 如果服务端有 definitionId -> futbinId 映射，用 fetchPlayerInformationMinimal 查
- * - 如果没有映射，用 getFilteredPlayers 查（需要客户端传球员属性）
- * - 映射持久化到 mapping.json
+ * 主数据源：futnext（启动时全量缓存 + 定时刷新）
+ * 兜底数据源：futbin（缓存未命中时使用）
+ * 启动时阻塞请求直到首次缓存构建完成
  */
 
 const { fetch } = require('undici');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { execFile } = require('child_process');
 
 // ========== 配置 ==========
 const FUTBIN_YEAR = 26;
 const FUTBIN_BASE = 'https://www.futbin.org/futbin/api/' + FUTBIN_YEAR;
 const PORT = process.env.PORT || 8787;
-const CACHE_TTL = 30 * 60 * 1000;       // 30 分钟（成功缓存）
-const FAIL_CACHE_TTL = 5 * 60 * 1000;   // 5 分钟（失败缓存）
+const CACHE_TTL = 30 * 60 * 1000;       // 30 分钟（futbin 成功缓存）
+const FAIL_CACHE_TTL = 5 * 60 * 1000;   // 5 分钟（futbin 失败缓存）
 const MAPPING_FILE = path.join(__dirname, '..', 'mapping.json');
 const FUTBIN_CONCURRENCY = 20;          // 同时向 futbin 发出的最大请求数
+const FUTNEXT_CONCURRENCY = 2;          // futnext 全量加载并发数
+const FUTNEXT_REFRESH_INTERVAL = 10 * 60 * 1000;  // 10 分钟刷新间隔
+const FUTNEXT_BASE_URL = 'https://www.futnext.com/player';
+const FUTNEXT_CURL_ARGS = [
+  '-s',
+  '-4',
+  '--connect-timeout', '10',
+  '-H', 'accept: */*',
+  '-H', 'accept-language: zh-CN,zh;q=0.9,en;q=0.8',
+  '-H', 'rsc: 1',
+  '-H', 'next-router-state-tree: %5B%22%22%2C%7B%22children%22%3A%5B%22(main)%22%2C%7B%22children%22%3A%5B%22player%22%2C%7B%22children%22%3A%5B%22__PAGE__%3F%7B%5C%22page%5C%22%3A%5C%221%5C%22%7D%22%2C%7B%7D%2C%22%2Fplayer%3Fpage%3D1%22%2C%22refresh%22%5D%7D%5D%7D%5D%7D%2Cnull%2C%22refetch%22%5D',
+  '-H', 'referer: https://www.futnext.com/player',
+  '-H', 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0',
+  '-H', 'sec-ch-ua: "Microsoft Edge";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+  '-H', 'sec-ch-ua-mobile: ?0',
+  '-H', 'sec-ch-ua-platform: "Windows"',
+  '-H', 'sec-fetch-dest: empty',
+  '-H', 'sec-fetch-mode: cors',
+  '-H', 'sec-fetch-site: same-origin',
+];
 
-// ========== Futbin 全局并发控制 ==========
+async function fetchFutnextPage(page, retries = 1) {
+  const targetUrl = `${FUTNEXT_BASE_URL}?page=${page}&_rsc=19q82`;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const stdout = await new Promise((resolve, reject) => {
+        execFile('curl', [targetUrl, ...FUTNEXT_CURL_ARGS], { timeout: 5000, maxBuffer: 2 * 1024 * 1024 }, (error, stdout) => {
+          if (error) return reject(error);
+          if (!stdout) return reject(new Error(`empty response for page ${page}`));
+          resolve(stdout);
+        });
+      });
+      return stdout;
+    } catch (err) {
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, 500));
+      } else {
+        throw err;
+      }
+    }
+  }
+}
 const futbinQueue = [];
 let futbinActive = 0;
 
@@ -45,10 +85,14 @@ function futbinDrain() {
 }
 
 // ========== 数据存储 ==========
+// futnext 全量缓存: definitionId -> { cheapestPrice, averagePrice, timestamp }
+let futnextCache = new Map();
+let cacheReady = false;
+
 // 映射表: definitionId -> futbinId (平台通用)
 let idMapping = {};
 
-// 价格缓存: platform -> definitionId -> { price, timestamp, error? }
+// futbin 价格缓存: platform -> definitionId -> { price, timestamp, error? }
 const priceCache = {};  // { pc: Map, ps: Map }
 
 // 正在进行的请求: `${platform}:${definitionId}` -> Promise
@@ -57,6 +101,81 @@ const pendingRequests = new Map();
 // ========== 初始化 ==========
 loadMapping();
 ensureCacheMaps();
+
+// ========== Futnext 全量加载 ==========
+let isLoading = false;
+
+async function loadFutnextCache() {
+  if (isLoading) {
+    console.log(`[Futnext] Load already in progress, skipping`);
+    return;
+  }
+  isLoading = true;
+  const start = Date.now();
+  console.log(`[Futnext] Starting full cache load...`);
+
+  // 第1页获取 totalPages
+  const firstPageRaw = await fetchFutnextPage(1);
+  const totalPages = parseFutnextTotalPages(firstPageRaw);
+  if (!totalPages) {
+    console.error(`[Futnext] Failed to get totalPages, aborting load`);
+    isLoading = false;
+    return;
+  }
+  console.log(`[Futnext] totalPages: ${totalPages}`);
+
+  // 解析第1页并写入临时缓存
+  const newCache = new Map();
+  mergePageIntoCache(newCache, firstPageRaw);
+
+  // 并发加载剩余页面（2..totalPages），2并发
+  const pages = [];
+  for (let i = 2; i <= totalPages; i++) pages.push(i);
+
+  for (let i = 0; i < pages.length; i += FUTNEXT_CONCURRENCY) {
+    const batch = pages.slice(i, i + FUTNEXT_CONCURRENCY);
+    const results = await Promise.allSettled(
+      batch.map(page => fetchFutnextPage(page))
+    );
+
+    let successCount = 0;
+    let failCount = 0;
+    for (let j = 0; j < results.length; j++) {
+      const r = results[j];
+      const page = batch[j];
+      if (r.status === 'fulfilled') {
+        try {
+          mergePageIntoCache(newCache, r.value);
+          console.log(`[Futnext] Page ${page}/${totalPages} OK, cache: ${newCache.size}`);
+        } catch (e) {
+          console.error(`[Futnext] Page ${page}/${totalPages} parse error: ${e.message}`);
+        }
+      } else {
+        console.error(`[Futnext] Page ${page}/${totalPages} fetch error: ${r.reason?.message}`);
+      }
+    }
+  }
+
+  // 原子替换
+  futnextCache = newCache;
+  const elapsed = Date.now() - start;
+  console.log(`[Futnext] Cache load complete: ${newCache.size} players in ${elapsed}ms`);
+
+  isLoading = false;
+}
+
+function mergePageIntoCache(cache, raw) {
+  const players = parseFutnextRSC(raw);
+  for (const p of players) {
+    if (p.id == null) continue;
+    // id 是每张卡的唯一标识，直接缓存
+    // null 价格当作 0 缓存
+    cache.set(p.id, {
+      cheapestPrice: p.cheapestPrice ?? 0,
+      averagePrice: p.averagePrice ?? 0,
+    });
+  }
+}
 
 // ========== HTTP Server ==========
 const server = http.createServer(async (req, res) => {
@@ -73,6 +192,8 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/stats') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
+      cacheReady,
+      futnextCacheSize: futnextCache.size,
       mappingCount: Object.keys(idMapping).length,
       cacheSize: {
         pc: priceCache.pc?.size || 0,
@@ -83,11 +204,33 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 全量价格查询
+  if (req.method === 'GET' && url.pathname === '/api/all-prices') {
+    if (!cacheReady) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Server is warming up, please retry later' }));
+      return;
+    }
+    const platform = url.searchParams.get('platform');
+    const allPrices = {};
+    for (const [id, data] of futnextCache) {
+      if (data.cheapestPrice != null) {
+        allPrices[id] = data.cheapestPrice;
+      }
+    }
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(JSON.stringify({ platform: platform || 'all', count: Object.keys(allPrices).length, prices: allPrices }));
+    return;
+  }
+
   // CORS 预检
   if (req.method === 'OPTIONS') {
     res.writeHead(200, {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
     });
     res.end();
@@ -96,6 +239,11 @@ const server = http.createServer(async (req, res) => {
 
   // 价格查询接口: POST /api/prices
   if (req.method === 'POST' && url.pathname === '/api/prices') {
+    if (!cacheReady) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Server is warming up, please retry later' }));
+      return;
+    }
     handlePriceQuery(req, res);
     return;
   }
@@ -148,7 +296,6 @@ function handlePriceQuery(req, res) {
   });
 }
 
-// ========== 请求处理 ==========
 function parseJsonBody(body) {
   try {
     const parsed = JSON.parse(body);
@@ -213,7 +360,6 @@ function validateRequest(body) {
 // ========== 价格查询 ==========
 async function batchGetPrices(definitionIds, platform, players) {
   const start = Date.now();
-  // 并行请求所有 ID
   const results = await Promise.all(
     definitionIds.map(id => getPrice(id, platform, players[id] || null))
   );
@@ -229,16 +375,24 @@ async function batchGetPrices(definitionIds, platform, players) {
 
 async function getPrice(definitionId, platform, playerInfo) {
   definitionId = Number(definitionId);
+
+  // 1. 先查 futnextCache（pc/ps 共用）
+  const cached = futnextCache.get(definitionId);
+  if (cached) {
+    return { price: cached.cheapestPrice };
+  }
+
+  // 2. 缓存未命中，走 futbin 兜底
   const cacheKey = `${platform}:${definitionId}`;
 
-  // 检查缓存
+  // 检查 futbin 缓存
   const cacheMap = priceCache[platform];
   if (cacheMap.has(definitionId)) {
-    const cached = cacheMap.get(definitionId);
-    const ttl = cached.error ? FAIL_CACHE_TTL : CACHE_TTL;
-    if (Date.now() - cached.timestamp < ttl) {
-      console.log(`[Cache HIT] ${definitionId}`);
-      return cached;
+    const futbinCached = cacheMap.get(definitionId);
+    const ttl = futbinCached.error ? FAIL_CACHE_TTL : CACHE_TTL;
+    if (Date.now() - futbinCached.timestamp < ttl) {
+      console.log(`[Futbin Cache HIT] ${definitionId}`);
+      return futbinCached;
     }
     cacheMap.delete(definitionId);
   }
@@ -261,16 +415,13 @@ async function doFetchPrice(definitionId, platform, playerInfo) {
   const futbinId = idMapping[definitionId];
 
   if (futbinId) {
-    // 有映射，用 fetchPlayerInformationMinimal
     return await fetchPriceByFutbinId(definitionId, futbinId, platform);
   }
 
-  // 没有映射，需要球员属性
   if (!playerInfo) {
     return { price: null, error: 'No mapping found and no player info provided' };
   }
 
-  // 用 getFilteredPlayers 查，同时建立映射
   return await fetchPriceByFilter(definitionId, playerInfo, platform);
 }
 
@@ -323,14 +474,12 @@ async function fetchPriceByFilter(definitionId, playerInfo, platform) {
       return { price: null, error: 'Player not found in filtered results' };
     }
 
-    // 建立并保存映射
     if (match.ID && !idMapping[definitionId]) {
       idMapping[definitionId] = match.ID;
       saveMapping();
       console.log(`[Mapping] definitionId=${definitionId} -> futbinId=${match.ID}`);
     }
 
-    // 同时缓存其他返回的球员映射和价格
     const now = Date.now();
     for (const item of data.data) {
       const rid = Number(item.resource_id);
@@ -362,7 +511,6 @@ function parsePriceFromMinimal(data, definitionId, platform) {
   const priceKey = platform === 'pc' ? 'pc_LCPrice' : 'ps_LCPrice';
 
   for (const item of data.data) {
-    // 验证 definitionId 一致性
     if (item.Player_Resource === definitionId || item.resource_id === definitionId) {
       const price = item.LCPrice || item[priceKey] || item.price || 0;
       return price;
@@ -418,9 +566,52 @@ function ensureCacheMaps() {
   priceCache.ps = new Map();
 }
 
+// ========== Futnext RSC 解析 ==========
+function parseFutnextTotalPages(raw) {
+  const lines = raw.trim().split('\n');
+  const lastLine = lines[lines.length - 1];
+  const after = lastLine.replace(/^12:/, '');
+  const match = after.match(/"totalPages":(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+function parseFutnextRSC(raw) {
+  const lines = raw.trim().split('\n');
+  const lastLine = lines[lines.length - 1];
+  const after = lastLine.replace(/^12:/, '');
+
+  const resultsIdx = after.indexOf('{"results":');
+  if (resultsIdx < 0) throw new Error('results not found in RSC payload');
+
+  let depth = 0;
+  let started = false;
+  let endIdx = resultsIdx;
+  for (let i = resultsIdx; i < after.length; i++) {
+    if (after[i] === '{') { depth++; started = true; }
+    if (after[i] === '}') { depth--; }
+    if (started && depth === 0) { endIdx = i; break; }
+  }
+
+  const resultsJson = after.substring(resultsIdx, endIdx + 1);
+  const data = JSON.parse(resultsJson);
+  const r = data.results;
+
+  return r.players.map(p => ({
+    id: p.id || null,
+    name: ((p.definition?.firstName || '') + ' ' + (p.definition?.lastName || '')).trim(),
+    rating: p.rating || null,
+    cheapestPrice: p.price?.cheapestPrice ?? null,
+    averagePrice: p.price?.averagePrice ?? null,
+    rarity: p.rarity ? { id: p.rarity.id, name: p.rarity.name } : null,
+    nation: p.nation ? { id: p.nation.id, name: p.nation.name } : null,
+    league: p.league ? { id: p.league.id, name: p.league.name } : null,
+    club: p.club ? { id: p.club.id, name: p.club.name } : null,
+  }));
+}
+
 // ========== 日志文件 ==========
 const logFile = path.join(__dirname, '..', 'server.log');
-const logStream = fs.createWriteStream(logFile, { flags: 'a' });
+const logStream = fs.createWriteStream(logFile, { flags: 'w' });
 const _log = console.log;
 const _error = console.error;
 const _warn = console.warn;
@@ -443,4 +634,27 @@ console.warn = function (...args) {
 // ========== 启动 ==========
 server.listen(PORT, () => {
   console.log(`EAFC Grinder Server running on http://localhost:${PORT}`);
+
+  // 启动时全量加载
+  (async () => {
+    try {
+      await loadFutnextCache();
+      cacheReady = true;
+      console.log(`[Futnext] Cache ready, accepting requests`);
+    } catch (err) {
+      console.error(`[Futnext] Initial load failed: ${err.message}`);
+      // 即使失败也标记 ready，允许 futbin 兜底
+      cacheReady = true;
+      console.warn(`[Futnext] Falling back to futbin-only mode`);
+    }
+  })();
+
+  // 定时刷新
+  setInterval(async () => {
+    try {
+      await loadFutnextCache();
+    } catch (err) {
+      console.error(`[Futnext] Refresh failed: ${err.message}`);
+    }
+  }, FUTNEXT_REFRESH_INTERVAL);
 });
